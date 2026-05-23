@@ -1,6 +1,6 @@
 /*
  * =====================================================
- *  M5CYBER NEWS v2  -  Multi-feed Italian RSS Reader
+ *  M5CYBER NEWS v2.1  -  Multi-feed Italian RSS Reader
  *  Target: M5StickC Plus2  (ESP32-PICO, 240x135 px)
  *
  *  CONTROLS
@@ -12,8 +12,8 @@
  *    BtnB  4 sec hold  -> WiFi portal
  *
  *  [Feed menu]
- *    BtnB  short       -> cycle feed list (wraps)
- *    BtnA  short       -> SELECT feed + load
+ *    BtnB  short       -> cycle list (feeds + power off)
+ *    BtnA  short       -> SELECT feed / confirm power off
  *    BtnA  2 sec hold  -> EXIT menu (no change)
  * =====================================================
  */
@@ -64,6 +64,24 @@ const FeedSource FEEDS[] = {
 };
 
 const int FEED_COUNT = sizeof(FEEDS) / sizeof(FEEDS[0]);
+const int MENU_ITEMS = FEED_COUNT + 1;   // feeds + POWER OFF entry
+const int POWER_OFF_IDX = FEED_COUNT;
+
+// =====================================================
+//  NOTE FREQUENCIES  (standard equal temperament)
+// =====================================================
+
+#define NOTE_C4   262
+#define NOTE_E4   330
+#define NOTE_G4   392
+#define NOTE_B4   494
+#define NOTE_C5   523
+#define NOTE_D5   587
+#define NOTE_E5   659
+#define NOTE_G5   784
+#define NOTE_B5   988
+#define NOTE_C6  1047
+#define NOTE_E6  1319
 
 // =====================================================
 //  APP STATE
@@ -173,6 +191,96 @@ void wrapText() {
     }
     if (line.length() > 0) wrappedLines.push_back(line);
     currentLineOffset = 0;
+}
+
+// =====================================================
+//  BUZZER  -  direct LEDC PWM drive
+//
+//  M5StickC Plus2 internal buzzer is on GPIO 2.
+//  We bypass the M5Unified Speaker abstraction and
+//  drive it directly via ESP32 LEDC peripheral.
+//  This is reliable on every library version.
+// =====================================================
+
+#define BUZZER_PIN  2
+
+// Play a single note: freq in Hz, duration in ms
+// Compatible with ESP32 Arduino core 3.x (new LEDC API)
+void playNote(int freq, int durationMs) {
+    ledcAttach(BUZZER_PIN, freq, 8);   // attach pin + set freq + 8-bit res
+    ledcWrite(BUZZER_PIN, 80);         // ~30% duty cycle
+    delay(durationMs);
+    ledcWrite(BUZZER_PIN, 0);          // silence
+    ledcDetach(BUZZER_PIN);
+    delay(18);                          // tiny gap between notes
+}
+
+// Startup jingle: ascending C major arpeggio + high finish
+// cheerful, quick (~950 ms total)
+void playStartupJingle() {
+    playNote(NOTE_C5, 80);
+    playNote(NOTE_E5, 80);
+    playNote(NOTE_G5, 80);
+    playNote(NOTE_B5, 80);
+    playNote(NOTE_E6, 320);
+}
+
+// Shutdown jingle: mirror descend, slower and softer
+// (~1100 ms total - finishes before powerOff)
+void playShutdownJingle() {
+    playNote(NOTE_E6, 100);
+    playNote(NOTE_B5, 100);
+    playNote(NOTE_G5, 100);
+    playNote(NOTE_E5, 100);
+    playNote(NOTE_C5, 460);
+}
+
+// =====================================================
+//  RENDER: BYE BYE
+// =====================================================
+
+void renderByeBye() {
+    StickCP2.Display.setBrightness(BRIGHTNESS_FULL);  // sveglia display se dimmato
+    canvas.fillSprite(BLACK);
+
+    // Red double border
+    canvas.drawRect(0, 0, 240, 135, RED);
+    canvas.drawRect(2, 2, 236, 131, 0x8000);
+
+    // Big "BYE BYE!" in red
+    canvas.setTextFont(4);
+    canvas.setTextColor(RED);
+    canvas.setCursor(44, 26);
+    canvas.print("BYE BYE!");
+
+    // Separator
+    canvas.drawFastHLine(20, 70, 200, 0x8000);
+
+    // Subtitle
+    canvas.setTextFont(2);
+    canvas.setTextColor(DARKGREY);
+    canvas.setCursor(44, 80);
+    canvas.print("powering off...");
+
+    // Hint
+    canvas.setTextFont(1);
+    canvas.setTextColor(0x4208);
+    canvas.setCursor(20, 112);
+    canvas.print("hold side button 2s to power on");
+
+    canvas.pushSprite(0, 0);
+    delay(200);  // ensure frame is fully pushed before jingle starts
+}
+
+// =====================================================
+//  POWER OFF  -  shows BYE BYE + jingle + cuts power
+// =====================================================
+
+void doPowerOff() {
+    renderByeBye();          // schermata visibile prima del jingle
+    playShutdownJingle();    // ~1100 ms, blocking via delay()
+    delay(800);              // pausa finale - schermata resta visibile
+    StickCP2.Power.powerOff();
 }
 
 // =====================================================
@@ -434,34 +542,48 @@ void renderMenu() {
     int scrollOff = 0;
     if (menuCursor >= VIS_ROWS) scrollOff = menuCursor - VIS_ROWS + 1;
 
-    for (int i = 0; i < VIS_ROWS && (i + scrollOff) < FEED_COUNT; i++) {
+    for (int i = 0; i < VIS_ROWS && (i + scrollOff) < MENU_ITEMS; i++) {
         int  idx = i + scrollOff;
         int  y   = START_Y + i * ROW_H;
         bool sel = (idx == menuCursor);
 
-        if (sel) {
-            canvas.fillRect(0, y, 230, ROW_H - 1, FEEDS[idx].color);
-            canvas.setTextColor(BLACK);
+        if (idx == POWER_OFF_IDX) {
+            // ── POWER OFF entry ─────────────────────
+            if (sel) {
+                canvas.fillRect(0, y, 230, ROW_H - 1, RED);
+                canvas.setTextColor(BLACK);
+            } else {
+                canvas.setTextColor(RED);
+            }
+            canvas.setTextFont(2);
+            canvas.setCursor(8, y + 1);
+            canvas.print("POWER OFF");
         } else {
-            canvas.setTextColor(0xC618);
-        }
-        canvas.setTextFont(2);
-        canvas.setCursor(8, y + 1);
-        canvas.print(FEEDS[idx].name);
+            // ── Feed entry ──────────────────────────
+            if (sel) {
+                canvas.fillRect(0, y, 230, ROW_H - 1, FEEDS[idx].color);
+                canvas.setTextColor(BLACK);
+            } else {
+                canvas.setTextColor(0xC618);
+            }
+            canvas.setTextFont(2);
+            canvas.setCursor(8, y + 1);
+            canvas.print(FEEDS[idx].name);
 
-        if (idx == currentFeed) {
-            canvas.setTextFont(1);
-            canvas.setTextColor(sel ? (uint16_t)BLACK : FEEDS[idx].color);
-            canvas.setCursor(183, y + 4);
-            canvas.print("[ON]");
+            if (idx == currentFeed) {
+                canvas.setTextFont(1);
+                canvas.setTextColor(sel ? (uint16_t)BLACK : FEEDS[idx].color);
+                canvas.setCursor(183, y + 4);
+                canvas.print("[ON]");
+            }
         }
     }
 
     // Scrollbar
-    if (FEED_COUNT > VIS_ROWS) {
+    if (MENU_ITEMS > VIS_ROWS) {
         int trackH = VIS_ROWS * ROW_H;
-        int thumbH = max(4, trackH * VIS_ROWS / FEED_COUNT);
-        int thumbY = START_Y + (menuCursor * (trackH - thumbH)) / max(1, FEED_COUNT - 1);
+        int thumbH = max(4, trackH * VIS_ROWS / MENU_ITEMS);
+        int thumbY = START_Y + (menuCursor * (trackH - thumbH)) / max(1, MENU_ITEMS - 1);
         canvas.fillRect(234, START_Y, 4, trackH, 0x2104);
         canvas.fillRect(234, thumbY,  4, thumbH, 0xC618);
     }
@@ -583,7 +705,7 @@ void setup() {
     canvas.createSprite(240, 135);
 
     renderSplash();
-    delay(2000);
+    playStartupJingle();   // ascending arpeggio on buzzer (~950 ms)
 
     startWifiPortal();
     fetchRSS();
@@ -636,16 +758,18 @@ void loop() {
     // ────────────────────────────────────────────────
     if (appMode == MODE_MENU) {
 
-        // BtnB -> scroll list down (wraps to top)
+        // BtnB -> cycle list down (feeds + POWER OFF, wraps)
         if (StickCP2.BtnB.wasReleased()) {
-            menuCursor = (menuCursor + 1) % FEED_COUNT;
+            menuCursor = (menuCursor + 1) % MENU_ITEMS;
             renderUI();
         }
 
-        // BtnA short -> confirm selection
+        // BtnA short -> select feed or power off
         if (StickCP2.BtnA.wasReleased()) {
             if (ignoreBtnA) {
                 ignoreBtnA = false;
+            } else if (menuCursor == POWER_OFF_IDX) {
+                doPowerOff();   // shows BYE BYE + jingle + powers off
             } else {
                 currentFeed = menuCursor;
                 fetchRSS();
