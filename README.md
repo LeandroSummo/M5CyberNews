@@ -1,221 +1,833 @@
-# M5CYBER NEWS
+/*
+ * =====================================================
+ *  M5CYBER NEWS v2.1  -  Multi-feed Italian RSS Reader
+ *  Target: M5StickC Plus2  (ESP32-PICO, 240x135 px)
+ *
+ *  CONTROLS
+ *  ─────────────────────────────────────────────────
+ *  [News mode]
+ *    BtnA  short       -> next article
+ *    BtnB  short       -> scroll text / back to top
+ *    BtnA  2 sec hold  -> open feed menu
+ *    BtnB  4 sec hold  -> WiFi portal
+ *
+ *  [Feed menu]
+ *    BtnB  short       -> cycle list (feeds + power off)
+ *    BtnA  short       -> SELECT feed / confirm power off
+ *    BtnA  2 sec hold  -> EXIT menu (no change)
+ * =====================================================
+ */
 
-![M5Cyber News - splash screen](docs/hero.jpg)
+#include <M5StickCPlus2.h>
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
+#include <WiFiManager.h>
+#include <vector>
 
-**M5CYBER NEWS** is a standalone Italian RSS news reader that runs on the
-[M5StickC Plus2](https://docs.m5stack.com/en/core/M5StickC%20PLUS2) — a
-thumb-sized ESP32 device with a 1.14" colour display.
+M5Canvas canvas(&StickCP2.Display);
 
-No phone. No app. No subscription. Just press a button and read the headlines.
+// =====================================================
+//  CONFIG
+// =====================================================
 
-The device connects to your WiFi, fetches fresh headlines from seven major
-Italian outlets every 60 seconds, and displays them word-wrapped on screen.
-A two-button interface lets you flip through articles, scroll long titles, and
-switch between news sources on the fly — all without touching a computer.
+#define MAX_NEWS          15
+#define CHARS_PER_LINE    22
+#define VISIBLE_LINES      4
 
-It is designed to sit on a desk, in a workshop, or in a pocket: something
-glanceable and distraction-free for staying informed during the day.
+#define REFRESH_INTERVAL  60000UL
+#define DIM_TIMEOUT       12000UL
+#define SCREEN_TIMEOUT    20000UL
+#define BRIGHTNESS_FULL     200
+#define BRIGHTNESS_DIM       40
+#define MENU_HOLD_MS       2000UL
+#define WIFI_HOLD_MS       4000UL
 
-![status](https://img.shields.io/badge/platform-M5StickC%20Plus2-orange)
-![status](https://img.shields.io/badge/language-C%2B%2B%20(Arduino)-blue)
-![status](https://img.shields.io/badge/license-MIT-green)
+// =====================================================
+//  FEED SOURCES
+// =====================================================
 
----
-
-## Screenshots
-
-| Splash screen | Reading news | Feed menu |
-|:---:|:---:|:---:|
-| ![Splash](docs/screen_splash.jpg) | ![News](docs/screen_news.jpg) | ![Menu](docs/screen_menu.jpg) |
-| Pixel-art boot screen | Headlines word-wrapped, scrollbar on the right, source and battery in the header | Switch between 7 sources with two buttons |
-
----
-
-## Features
-
-- **7 Italian news feeds** — ANSA, Corriere della Sera, Repubblica, Il Sole 24 Ore,
-  TGcom24, La Stampa, Il Fatto Quotidiano.
-- **On-device feed menu** — switch source without reflashing.
-- **Pixel-art splash screen** — bitmap "NEWS!" drawn at boot from a custom 5×7
-  pixel font rendered with `fillRect()`.
-- **Per-source colour coding** — the header colour tells you which outlet you
-  are reading at a glance.
-- **Word-wrapped headlines** with a proportional vertical scrollbar for long
-  titles.
-- **Auto-refresh** every 60 seconds in the background.
-- **Battery saver** — display dims to 16% brightness after 12 s of inactivity,
-  sleeps after 20 s; first button press wakes it without triggering an action.
-- **WiFi captive portal** — first-run setup via WiFiManager; credentials are
-  saved to flash and survive reboots. No hardcoded passwords.
-- **Robust RSS text cleaning** — HTML entities, UTF-8 accented vowels,
-  typographic quotes, Windows-1252 leftovers, and CDATA wrappers are all
-  stripped before display.
-
----
-
-## Hardware
-
-| Component | Notes |
-|-----------|-------|
-| **M5StickC Plus2** | ESP32-PICO, 240×135 px ST7789V2 display, 200 mAh battery |
-| USB-C cable | For flashing only |
-| 2.4 GHz WiFi | For fetching feeds |
-
----
-
-## Feed sources
-
-| # | Outlet              | RSS URL                                                  |
-|---|---------------------|----------------------------------------------------------|
-| 1 | ANSA                | `https://www.ansa.it/sito/ansait_rss.xml`                |
-| 2 | Corriere della Sera | `https://xml2.corriereobjects.it/rss/homepage.xml`       |
-| 3 | Repubblica          | `https://www.repubblica.it/rss/homepage/rss2.0.xml`      |
-| 4 | Il Sole 24 Ore      | `https://www.ilsole24ore.com/rss/italia.xml`             |
-| 5 | TGcom24             | `https://www.tgcom24.mediaset.it/rss/homepage.xml`       |
-| 6 | La Stampa           | `https://www.lastampa.it/rss/copertina.xml`              |
-| 7 | Il Fatto Quotidiano | `https://www.ilfattoquotidiano.it/feed/`                 |
-
-RSS endpoints occasionally change. If a feed stops loading, update its URL
-inside the `FEEDS[]` array — see [Customization](#customization).
-
----
-
-## Controls
-
-### Reading news
-
-| Button | Action |
-|--------|--------|
-| **A** short press | Next article |
-| **B** short press | Scroll text down / back to top |
-| **A** hold 2 s | Open feed menu |
-| **B** hold 4 s | Open WiFi configuration portal |
-
-### Feed menu
-
-| Button | Action |
-|--------|--------|
-| **B** short press | Cycle to next feed (wraps around) |
-| **A** short press | Select feed and load |
-| **A** hold 2 s | Exit menu without changing source |
-
-> **Button C (power button):** the current M5StickCPlus2 library does not
-> expose `BtnPWR` on older releases. Update **M5StickCPlus2**, **M5Unified**,
-> and **M5GFX** to the latest versions via the Library Manager to gain
-> B=up / C=down / A=select three-button navigation.
-
----
-
-## Installation
-
-### 1. Install the ESP32 board package
-
-In Arduino IDE: **Tools → Board → Boards Manager** → search
-**esp32 by Espressif Systems** → Install.
-
-Select **M5StickC Plus2** as the target board.
-
-### 2. Install required libraries
-
-**Tools → Manage Libraries**, install the latest version of each:
-
-| Library | Author |
-|---------|--------|
-| M5StickCPlus2 | M5Stack |
-| M5Unified | M5Stack |
-| M5GFX | M5Stack |
-| WiFiManager | tzapu |
-
-### 3. Upload
-
-Open `M5CyberNews.ino`, select the correct serial port, click **Upload**.
-
----
-
-## First run — WiFi setup
-
-The device has no hardcoded network credentials. On first boot it starts a
-captive portal:
-
-1. On any phone or laptop, connect to the WiFi network **`M5-CYBER`**.
-2. A configuration page opens automatically in your browser.
-3. Choose your home network, enter the password, save.
-4. The device connects and starts loading headlines.
-
-To reconfigure WiFi at any time: hold **Button B for 4 seconds** in reading
-mode. The portal reopens and closes automatically after 3 minutes if unused.
-
----
-
-## Customization
-
-All user-facing settings are `#define` constants and the `FEEDS[]` array at
-the top of `M5CyberNews.ino`.
-
-### Add or replace a feed
-
-```cpp
-const FeedSource FEEDS[] = {
-    { "ANSA",   "https://www.ansa.it/sito/ansait_rss.xml",  0x07E0 },
-    { "MY FEED","https://example.com/feed.xml",             0xF800 },
-    // up to however many you need
+struct FeedSource {
+    const char* name;
+    const char* url;
+    uint16_t    color;
 };
-```
 
-Each entry is `{ display name (max ~9 chars), URL, RGB565 colour }`.
-The colour becomes the header bar and accent colour for that source.
+const FeedSource FEEDS[] = {
+    { "ANSA",       "https://www.ansa.it/sito/ansait_rss.xml",                 0x07E0 },
+    { "CORRIERE",   "https://xml2.corriereobjects.it/rss/homepage.xml",         0xF800 },
+    { "REPUBBLICA", "https://www.repubblica.it/rss/homepage/rss2.0.xml",        0x001F },
+    { "SOLE 24H",   "https://www.ilsole24ore.com/rss/italia.xml",               0xFD20 },
+    { "TGCOM24",    "https://www.tgcom24.mediaset.it/rss/homepage.xml",         0xF81F },
+    { "LA STAMPA",  "https://www.lastampa.it/rss/copertina.xml",                0x07FF },
+    { "IL FATTO",   "https://www.ilfattoquotidiano.it/feed/",                   0xFFE0 },
+};
 
-### Timing and power
+const int FEED_COUNT = sizeof(FEEDS) / sizeof(FEEDS[0]);
+const int MENU_ITEMS = FEED_COUNT + 1;   // feeds + POWER OFF entry
+const int POWER_OFF_IDX = FEED_COUNT;
 
-| Constant | Default | Description |
-|----------|---------|-------------|
-| `REFRESH_INTERVAL` | `60000` ms | How often to fetch fresh headlines |
-| `DIM_TIMEOUT` | `12000` ms | Idle time before screen dims |
-| `SCREEN_TIMEOUT` | `20000` ms | Idle time before screen sleeps |
-| `BRIGHTNESS_FULL` | `200` | Normal backlight (0–255) |
-| `BRIGHTNESS_DIM` | `40` | Dimmed backlight (0–255) |
-| `MAX_NEWS` | `15` | Maximum headlines stored per feed |
+// =====================================================
+//  NOTE FREQUENCIES  (standard equal temperament)
+// =====================================================
 
----
+#define NOTE_C4   262
+#define NOTE_E4   330
+#define NOTE_G4   392
+#define NOTE_B4   494
+#define NOTE_C5   523
+#define NOTE_D5   587
+#define NOTE_E5   659
+#define NOTE_G5   784
+#define NOTE_B5   988
+#define NOTE_C6  1047
+#define NOTE_E6  1319
 
-## How it works
+// =====================================================
+//  APP STATE
+// =====================================================
 
-```
-boot
- └─ renderSplash()          draws pixel-art "NEWS!" from 5×7 bitmaps
- └─ startWifiPortal()       connects or opens captive portal
- └─ fetchRSS()              HTTPS GET → parse <title> tags → cleanText()
- └─ main loop
-      ├─ auto-dim / sleep    power management on idle
-      ├─ BtnA / BtnB         state machine: MODE_NEWS / MODE_MENU
-      └─ auto-refresh        re-fetches every REFRESH_INTERVAL ms
-```
+enum AppMode { MODE_NEWS, MODE_MENU, MODE_LOADING };
 
-Headlines are fetched over HTTPS (`WiFiClientSecure`, certificate check
-disabled for simplicity). The raw XML is scanned with `indexOf()` — no XML
-library dependency. Text is cleaned, word-wrapped into a `std::vector<String>`,
-and rendered to an off-screen `M5Canvas` sprite, then pushed to the display in
-a single `pushSprite()` call to avoid flicker.
+AppMode appMode        = MODE_NEWS;
+int     currentFeed    = 0;
+int     menuCursor     = 0;
+bool    ignoreBtnA     = false;
 
----
+String  newsTitles[MAX_NEWS];
+std::vector<String> wrappedLines;
 
-## Project structure
+int  totalNews         = 0;
+int  currentNews       = 0;
+int  currentLineOffset = 0;
 
-```
-M5CyberNews/
-├── M5CyberNews.ino   Main firmware (single-file Arduino sketch)
-├── README.md
-├── LICENSE
-├── .gitignore
-└── docs/             Device photos used in this README
-```
+bool displaySleeping   = false;
+bool displayDimmed     = false;
+bool wifiError         = false;
 
----
+unsigned long lastRefresh     = 0;
+unsigned long lastInteraction = 0;
 
-## License
+// =====================================================
+//  CLEAN RSS TEXT
+// =====================================================
 
-Released under the **MIT License** — see [LICENSE](LICENSE).
+String cleanText(String text) {
+    text.replace("<![CDATA[", "");
+    text.replace("]]>", "");
+    text.replace("&amp;",  "&");
+    text.replace("&lt;",   "<");
+    text.replace("&gt;",   ">");
+    text.replace("&quot;", "\"");
+    text.replace("&#039;", "'");
+    text.replace("&apos;", "'");
+    text.replace("&agrave;", "a"); text.replace("&Agrave;", "A");
+    text.replace("&egrave;", "e"); text.replace("&Egrave;", "E");
+    text.replace("&eacute;", "e"); text.replace("&Eacute;", "E");
+    text.replace("&igrave;", "i"); text.replace("&Igrave;", "I");
+    text.replace("&ograve;", "o"); text.replace("&Ograve;", "O");
+    text.replace("&ugrave;", "u"); text.replace("&Ugrave;", "U");
+    text.replace("\xc3\xa0", "a"); text.replace("\xc3\x80", "A");
+    text.replace("\xc3\xa8", "e"); text.replace("\xc3\x88", "E");
+    text.replace("\xc3\xa9", "e"); text.replace("\xc3\x89", "E");
+    text.replace("\xc3\xac", "i"); text.replace("\xc3\x8c", "I");
+    text.replace("\xc3\xb2", "o"); text.replace("\xc3\x92", "O");
+    text.replace("\xc3\xb9", "u"); text.replace("\xc3\x99", "U");
+    text.replace("\xe0", "a"); text.replace("\xe8", "e");
+    text.replace("\xe9", "e"); text.replace("\xec", "i");
+    text.replace("\xf2", "o"); text.replace("\xf9", "u");
+    text.replace("\xe2\x80\x9c", "\"");
+    text.replace("\xe2\x80\x9d", "\"");
+    text.replace("\xe2\x80\x98", "'");
+    text.replace("\xe2\x80\x99", "'");
+    text.replace("\xe2\x80\x93", "-");
+    text.replace("\xe2\x80\x94", "-");
+    text.replace("\xe2\x80\xa6", "...");
+    text.replace("\x85", "..."); text.replace("\x96", "-");
+    text.replace("\x97", "-");   text.replace("\x91", "'");
+    text.replace("\x92", "'");   text.replace("\x93", "\"");
+    text.replace("\x94", "\"");
+    text.replace("\n", " "); text.replace("\r", " "); text.replace("\t", " ");
+    while (text.indexOf("  ") >= 0) text.replace("  ", " ");
+    text.trim();
+    return text;
+}
 
-News content belongs to the respective publishers. This project only fetches
-and displays their publicly available RSS headlines; no content is stored or
-redistributed.
+// =====================================================
+//  WORD WRAP
+// =====================================================
+
+void wrapText() {
+    wrappedLines.clear();
+    if (totalNews == 0) {
+        wrappedLines.push_back("No news loaded");
+        currentLineOffset = 0;
+        return;
+    }
+    String text = newsTitles[currentNews];
+    String word = "";
+    String line = "";
+    text += ' ';
+    for (int i = 0; i < (int)text.length(); i++) {
+        char c = text[i];
+        if (c == ' ') {
+            if (word.length() == 0) continue;
+            if (line.length() == 0) {
+                line = word;
+            } else if (line.length() + 1 + word.length() <= CHARS_PER_LINE) {
+                line += ' '; line += word;
+            } else {
+                wrappedLines.push_back(line); line = word;
+            }
+            word = "";
+        } else {
+            if (word.length() >= CHARS_PER_LINE) {
+                if (line.length() > 0) wrappedLines.push_back(line);
+                wrappedLines.push_back(word);
+                word = ""; line = "";
+            }
+            word += c;
+        }
+    }
+    if (line.length() > 0) wrappedLines.push_back(line);
+    currentLineOffset = 0;
+}
+
+// =====================================================
+//  JINGLES  -  startup and shutdown melodies
+//  Uses M5StickC Plus2 built-in passive buzzer via
+//  M5Unified Speaker API.
+//  tone() is non-blocking: delay() lets the note play.
+// =====================================================
+
+void playStartupJingle() {
+    StickCP2.Speaker.setVolume(160);
+    // Ascending fanfare: C5-E5-G5 then B5-E6 finish
+    StickCP2.Speaker.tone(NOTE_C5, 90);  delay(100);
+    StickCP2.Speaker.tone(NOTE_E5, 90);  delay(100);
+    StickCP2.Speaker.tone(NOTE_G5, 90);  delay(100);
+    StickCP2.Speaker.tone(NOTE_B5, 90);  delay(100);
+    StickCP2.Speaker.tone(NOTE_E6, 350); delay(400);
+    StickCP2.Speaker.stop();
+}
+
+void playShutdownJingle() {
+    StickCP2.Speaker.setVolume(140);
+    // Descending farewell: mirror of startup, slower
+    StickCP2.Speaker.tone(NOTE_E6, 120); delay(140);
+    StickCP2.Speaker.tone(NOTE_B5, 120); delay(140);
+    StickCP2.Speaker.tone(NOTE_G5, 120); delay(140);
+    StickCP2.Speaker.tone(NOTE_E5, 120); delay(140);
+    StickCP2.Speaker.tone(NOTE_C5, 500); delay(560);
+    StickCP2.Speaker.stop();
+}
+
+// =====================================================
+//  RENDER: BYE BYE
+// =====================================================
+
+void renderByeBye() {
+    canvas.fillSprite(BLACK);
+
+    // Red double border
+    canvas.drawRect(0, 0, 240, 135, RED);
+    canvas.drawRect(2, 2, 236, 131, 0x8000);
+
+    // Big "BYE BYE!" in red
+    canvas.setTextFont(4);
+    canvas.setTextColor(RED);
+    canvas.setCursor(44, 26);
+    canvas.print("BYE BYE!");
+
+    // Separator
+    canvas.drawFastHLine(20, 70, 200, 0x8000);
+
+    // Subtitle
+    canvas.setTextFont(2);
+    canvas.setTextColor(DARKGREY);
+    canvas.setCursor(44, 80);
+    canvas.print("powering off...");
+
+    // Hint
+    canvas.setTextFont(1);
+    canvas.setTextColor(0x4208);
+    canvas.setCursor(20, 112);
+    canvas.print("hold side button 2s to power on");
+
+    canvas.pushSprite(0, 0);
+}
+
+// =====================================================
+//  POWER OFF  -  shows BYE BYE + jingle + cuts power
+// =====================================================
+
+void doPowerOff() {
+    renderByeBye();
+    playShutdownJingle();
+    delay(600);
+    StickCP2.Power.powerOff();
+}
+
+// =====================================================
+//  FORWARD DECLARATION
+// =====================================================
+
+void renderUI();
+
+// =====================================================
+//  SPLASH  -  Pixel-art "NEWS!" drawn with fillRect
+//
+//  Each letter is a 5-col x 7-row bitmap.
+//  Each "pixel" renders as a (PX_W-1) x (PX_H-1) rect
+//  leaving a 1-px gap for a clean grid look.
+//
+//  Bit order per row: bit 4 = leftmost column.
+// =====================================================
+
+// --- glyph bitmaps (5 cols x 7 rows) ---------------
+
+const uint8_t G_N[7] = {
+    0b10001,   //  #   #
+    0b11001,   //  ##  #
+    0b10101,   //  # # #
+    0b10011,   //  #  ##
+    0b10001,   //  #   #
+    0b10001,   //  #   #
+    0b10001    //  #   #
+};
+const uint8_t G_E[7] = {
+    0b11111,   //  #####
+    0b10000,   //  #
+    0b10000,   //  #
+    0b11110,   //  ####
+    0b10000,   //  #
+    0b10000,   //  #
+    0b11111    //  #####
+};
+const uint8_t G_W[7] = {
+    0b10001,   //  #   #
+    0b10001,   //  #   #
+    0b10001,   //  #   #
+    0b10101,   //  # # #
+    0b10101,   //  # # #
+    0b11011,   //  ## ##
+    0b10001    //  #   #
+};
+const uint8_t G_S[7] = {
+    0b01111,   //   ####
+    0b10000,   //  #
+    0b10000,   //  #
+    0b01110,   //   ###
+    0b00001,   //      #
+    0b00001,   //      #
+    0b11110    //  ####
+};
+
+// Exclamation mark: 2 cols x 7 rows (bit 1 = left col)
+const uint8_t G_EXCL[7] = {
+    0b11,      //  ##
+    0b11,      //  ##
+    0b11,      //  ##
+    0b11,      //  ##
+    0b00,      //
+    0b11,      //  ##
+    0b00       //
+};
+
+// Draw a glyph at (x,y). cols = number of bit columns in the mask.
+void drawGlyph(int x, int y, const uint8_t* g, int cols, uint16_t col) {
+    const int PX_W = 5;
+    const int PX_H = 8;
+    for (int row = 0; row < 7; row++) {
+        for (int c = 0; c < cols; c++) {
+            if (g[row] & (1 << (cols - 1 - c))) {
+                canvas.fillRect(
+                    x + c * PX_W,
+                    y + row * PX_H,
+                    PX_W - 1,
+                    PX_H - 1,
+                    col
+                );
+            }
+        }
+    }
+}
+
+void renderSplash() {
+    canvas.fillSprite(BLACK);
+
+    // Double border for depth
+    canvas.drawRect(0, 0, 240, 135, 0x07E0);          // outer green
+    canvas.drawRect(2, 2, 236, 131, 0x03E0);           // inner darker green
+
+    // Scanline effect: subtle dark horizontal stripes across the art area
+    for (int y = 18; y < 88; y += 2) {
+        canvas.drawFastHLine(4, y, 232, 0x0200);        // near-black green tint
+    }
+
+    // ── Pixel-art "NEWS!" ──────────────────────────
+    //  PX_W=5, PX_H=8 -> letter = 25x56 px
+    //  N,E,W,S: 5-col glyphs  ->  width = 5*5 = 25 px
+    //  !       : 2-col glyph  ->  width = 2*5 = 10 px
+    //  gap between letters    :  5 px
+    //  total = (25+5)*4 + 10  = 130 px  -> start x = (240-130)/2 = 55
+    // ───────────────────────────────────────────────
+
+    const int LWIDTH = 25;   // letter pixel width
+    const int GAP    = 5;    // gap between letters
+    const int SX     = 55;   // start x
+    const int SY     = 16;   // start y
+    const uint16_t GC = 0x07E0;   // glyph color (green)
+
+    drawGlyph(SX + 0*(LWIDTH+GAP), SY, G_N,    5, GC);
+    drawGlyph(SX + 1*(LWIDTH+GAP), SY, G_E,    5, GC);
+    drawGlyph(SX + 2*(LWIDTH+GAP), SY, G_W,    5, GC);
+    drawGlyph(SX + 3*(LWIDTH+GAP), SY, G_S,    5, GC);
+    drawGlyph(SX + 4*(LWIDTH+GAP), SY, G_EXCL, 2, GC);
+
+    // ── Decorative line ────────────────────────────
+    canvas.drawFastHLine(10, 90, 220, 0x07E0);
+    canvas.drawFastHLine(10, 92, 220, 0x03E0);
+
+    // ── Subtitle ───────────────────────────────────
+    canvas.setTextFont(2);
+    canvas.setTextColor(0x8410);   // medium grey
+    canvas.setCursor(44, 98);
+    canvas.print("M5CYBER  MULTI-FEED  v2");
+
+    // ── Hint ───────────────────────────────────────
+    canvas.setTextFont(1);
+    canvas.setTextColor(0x2104);   // dark grey
+    canvas.setCursor(72, 119);
+    canvas.print("connecting to WiFi...");
+
+    canvas.pushSprite(0, 0);
+}
+
+// =====================================================
+//  FETCH RSS
+// =====================================================
+
+void fetchRSS() {
+    appMode = MODE_LOADING;
+    renderUI();
+
+    WiFiClientSecure client;
+    client.setInsecure();
+    HTTPClient http;
+    http.setTimeout(10000);
+    http.begin(client, FEEDS[currentFeed].url);
+    int httpCode = http.GET();
+
+    if (httpCode == HTTP_CODE_OK) {
+        String payload = http.getString();
+        totalNews = 0;
+        int pos = payload.indexOf("<item>");
+        while (pos != -1 && totalNews < MAX_NEWS) {
+            int ts = payload.indexOf("<title>", pos);
+            int te = payload.indexOf("</title>", ts);
+            if (ts != -1 && te != -1) {
+                String title = payload.substring(ts + 7, te);
+                title = cleanText(title);
+                if (title.length() > 0) newsTitles[totalNews++] = title;
+            }
+            pos = payload.indexOf("<item>", pos + 1);
+        }
+        wifiError = false;
+    } else {
+        wifiError = true;
+        totalNews = 1;
+        newsTitles[0] = "HTTP error " + String(httpCode);
+    }
+    http.end();
+
+    currentNews = 0;
+    wrapText();
+    appMode = MODE_NEWS;
+}
+
+// =====================================================
+//  WIFI PORTAL
+// =====================================================
+
+void startWifiPortal() {
+    WiFiManager wm;
+    wm.setConfigPortalTimeout(180);
+
+    canvas.fillSprite(BLACK);
+    canvas.fillRect(0, 0, 240, 18, 0x4208);
+    canvas.setTextColor(WHITE);
+    canvas.setTextFont(1);
+    canvas.setCursor(6, 5);
+    canvas.print("WiFi SETUP");
+
+    canvas.setTextFont(2);
+    canvas.setTextColor(WHITE);
+    canvas.setCursor(28, 38);
+    canvas.print("Connect to:");
+    canvas.setTextColor(0x07E0);
+    canvas.setCursor(52, 60);
+    canvas.print("M5-CYBER");
+
+    canvas.setTextFont(1);
+    canvas.setTextColor(DARKGREY);
+    canvas.setCursor(14, 94);
+    canvas.print("Portal closes in 3 minutes.");
+    canvas.setCursor(22, 110);
+    canvas.print("Timeout -> device restart");
+    canvas.pushSprite(0, 0);
+
+    if (!wm.autoConnect("M5-CYBER")) ESP.restart();
+}
+
+// =====================================================
+//  RENDER: LOADING
+// =====================================================
+
+void renderLoading() {
+    canvas.fillSprite(BLACK);
+
+    uint16_t fc = FEEDS[currentFeed].color;
+    canvas.fillRect(0, 0, 240, 18, fc);
+    canvas.setTextColor(BLACK);
+    canvas.setTextFont(1);
+    canvas.setCursor(6, 5);
+    canvas.print(FEEDS[currentFeed].name);
+
+    canvas.setTextColor(WHITE);
+    canvas.setTextFont(2);
+    canvas.setCursor(54, 50);
+    canvas.print("LOADING...");
+
+    canvas.fillCircle(102, 88, 5, fc);
+    canvas.drawCircle(120, 88, 5, fc);
+    canvas.drawCircle(138, 88, 5, fc);
+
+    canvas.pushSprite(0, 0);
+}
+
+// =====================================================
+//  RENDER: MENU
+// =====================================================
+
+void renderMenu() {
+    canvas.fillSprite(BLACK);
+
+    // Header
+    canvas.fillRect(0, 0, 240, 18, 0x630C);
+    canvas.setTextColor(WHITE);
+    canvas.setTextFont(1);
+    canvas.setCursor(6, 5);
+    canvas.print("SELECT FEED SOURCE");
+
+    const int ROW_H    = 16;
+    const int START_Y  = 20;
+    const int VIS_ROWS = 6;
+
+    int scrollOff = 0;
+    if (menuCursor >= VIS_ROWS) scrollOff = menuCursor - VIS_ROWS + 1;
+
+    for (int i = 0; i < VIS_ROWS && (i + scrollOff) < MENU_ITEMS; i++) {
+        int  idx = i + scrollOff;
+        int  y   = START_Y + i * ROW_H;
+        bool sel = (idx == menuCursor);
+
+        if (idx == POWER_OFF_IDX) {
+            // ── POWER OFF entry ─────────────────────
+            if (sel) {
+                canvas.fillRect(0, y, 230, ROW_H - 1, RED);
+                canvas.setTextColor(BLACK);
+            } else {
+                canvas.setTextColor(RED);
+            }
+            canvas.setTextFont(2);
+            canvas.setCursor(8, y + 1);
+            canvas.print("POWER OFF");
+        } else {
+            // ── Feed entry ──────────────────────────
+            if (sel) {
+                canvas.fillRect(0, y, 230, ROW_H - 1, FEEDS[idx].color);
+                canvas.setTextColor(BLACK);
+            } else {
+                canvas.setTextColor(0xC618);
+            }
+            canvas.setTextFont(2);
+            canvas.setCursor(8, y + 1);
+            canvas.print(FEEDS[idx].name);
+
+            if (idx == currentFeed) {
+                canvas.setTextFont(1);
+                canvas.setTextColor(sel ? (uint16_t)BLACK : FEEDS[idx].color);
+                canvas.setCursor(183, y + 4);
+                canvas.print("[ON]");
+            }
+        }
+    }
+
+    // Scrollbar
+    if (MENU_ITEMS > VIS_ROWS) {
+        int trackH = VIS_ROWS * ROW_H;
+        int thumbH = max(4, trackH * VIS_ROWS / MENU_ITEMS);
+        int thumbY = START_Y + (menuCursor * (trackH - thumbH)) / max(1, MENU_ITEMS - 1);
+        canvas.fillRect(234, START_Y, 4, trackH, 0x2104);
+        canvas.fillRect(234, thumbY,  4, thumbH, 0xC618);
+    }
+
+    // Footer
+    canvas.setTextColor(0x4208);
+    canvas.setTextFont(1);
+    canvas.setCursor(8, 122);
+    canvas.print("B NEXT FEED     A SELECT     Ahold EXIT");
+
+    canvas.pushSprite(0, 0);
+}
+
+// =====================================================
+//  RENDER: NEWS
+// =====================================================
+
+void renderNews() {
+    if (displaySleeping) return;
+    canvas.fillSprite(BLACK);
+
+    // Header
+    uint16_t hdrColor = wifiError ? (uint16_t)RED : FEEDS[currentFeed].color;
+    canvas.fillRect(0, 0, 240, 18, hdrColor);
+    canvas.setTextColor(BLACK);
+    canvas.setTextFont(1);
+    char hdr[36];
+    sprintf(hdr, "%s  %d/%d", FEEDS[currentFeed].name, currentNews + 1, totalNews);
+    canvas.setCursor(6, 5);
+    canvas.print(hdr);
+
+    int  bat = StickCP2.Power.getBatteryLevel();
+    char batStr[8];
+    sprintf(batStr, "%d%%", bat);
+    canvas.setTextColor(bat <= 20 ? (uint16_t)RED : (uint16_t)BLACK);
+    canvas.setCursor(205, 5);
+    canvas.print(batStr);
+
+    // News box
+    canvas.drawRect(0, 20, 240, 96, 0x4208);
+
+    // Text
+    canvas.setTextColor(WHITE);
+    canvas.setTextFont(2);
+    int y = 28;
+    for (int i = currentLineOffset;
+         i < min(currentLineOffset + VISIBLE_LINES, (int)wrappedLines.size());
+         i++) {
+        canvas.setCursor(8, y);
+        canvas.print(wrappedLines[i]);
+        y += 18;
+    }
+
+    // Scroll thumb
+    if ((int)wrappedLines.size() > VISIBLE_LINES) {
+        int total  = (int)wrappedLines.size();
+        int trackH = 80;
+        int thumbH = max(6, trackH * VISIBLE_LINES / total);
+        int maxOff = total - VISIBLE_LINES;
+        int thumbY = 22 + (currentLineOffset * (trackH - thumbH)) / max(1, maxOff);
+        canvas.fillRect(234, 22, 4, trackH, 0x2104);
+        canvas.fillRect(234, thumbY, 4, thumbH, FEEDS[currentFeed].color);
+    }
+
+    // Footer
+    bool hasMore = (currentLineOffset + VISIBLE_LINES < (int)wrappedLines.size());
+    canvas.setTextFont(1);
+    if (hasMore) {
+        canvas.setTextColor(FEEDS[currentFeed].color);
+        canvas.setCursor(8, 122);
+        canvas.print("A NEXT   B SCROLL    Ahold MENU");
+    } else {
+        canvas.setTextColor(0x4208);
+        canvas.setCursor(8, 122);
+        canvas.print("A NEXT   B TOP       Ahold MENU");
+    }
+
+    canvas.pushSprite(0, 0);
+}
+
+// =====================================================
+//  MASTER RENDER
+// =====================================================
+
+void renderUI() {
+    switch (appMode) {
+        case MODE_LOADING: renderLoading(); break;
+        case MODE_MENU:    renderMenu();    break;
+        case MODE_NEWS:    renderNews();    break;
+    }
+}
+
+// =====================================================
+//  WAKE / DIM
+// =====================================================
+
+void wakeDisplay() {
+    if (displaySleeping) {
+        StickCP2.Display.wakeup();
+        StickCP2.Display.setBrightness(BRIGHTNESS_FULL);
+        displaySleeping = false;
+        displayDimmed   = false;
+    } else if (displayDimmed) {
+        StickCP2.Display.setBrightness(BRIGHTNESS_FULL);
+        displayDimmed = false;
+    }
+    lastInteraction = millis();
+}
+
+// =====================================================
+//  SETUP
+// =====================================================
+
+void setup() {
+    auto cfg = M5.config();
+    StickCP2.begin(cfg);
+    StickCP2.Display.setRotation(1);
+    StickCP2.Display.setBrightness(BRIGHTNESS_FULL);
+    canvas.createSprite(240, 135);
+
+    StickCP2.Speaker.begin();
+    StickCP2.Speaker.setVolume(160);
+
+    renderSplash();
+    playStartupJingle();   // suona durante lo splash (~900 ms)
+
+    startWifiPortal();
+    fetchRSS();
+    renderUI();
+
+    lastRefresh     = millis();
+    lastInteraction = millis();
+}
+
+// =====================================================
+//  LOOP
+// =====================================================
+
+void loop() {
+    StickCP2.update();
+
+    unsigned long idleMs = millis() - lastInteraction;
+
+    // Auto-dim
+    if (!displaySleeping && !displayDimmed && idleMs > DIM_TIMEOUT) {
+        StickCP2.Display.setBrightness(BRIGHTNESS_DIM);
+        displayDimmed = true;
+    }
+
+    // Auto-sleep
+    if (!displaySleeping && idleMs > SCREEN_TIMEOUT) {
+        StickCP2.Display.sleep();
+        displaySleeping = true;
+        displayDimmed   = false;
+    }
+
+    // Wake from dim or sleep: first press wakes only, no action
+    if (displaySleeping || displayDimmed) {
+        if (StickCP2.BtnA.wasPressed() || StickCP2.BtnB.wasPressed()) {
+            wakeDisplay();
+        }
+        delay(20);
+        return;
+    }
+
+    // ────────────────────────────────────────────────
+    //  MODE_MENU
+    //    BtnB  short   -> cycle feed list (down, wraps)
+    //    BtnA  short   -> SELECT highlighted feed + load
+    //    BtnA  2s hold -> EXIT menu (no change)
+    //
+    //  NOTE: Button C (power) is not accessible with this
+    //  library version. Update M5StickCPlus2 + M5Unified
+    //  to latest to get StickCP2.BtnPWR support.
+    // ────────────────────────────────────────────────
+    if (appMode == MODE_MENU) {
+
+        // BtnB -> cycle list down (feeds + POWER OFF, wraps)
+        if (StickCP2.BtnB.wasReleased()) {
+            menuCursor = (menuCursor + 1) % MENU_ITEMS;
+            renderUI();
+        }
+
+        // BtnA short -> select feed or power off
+        if (StickCP2.BtnA.wasReleased()) {
+            if (ignoreBtnA) {
+                ignoreBtnA = false;
+            } else if (menuCursor == POWER_OFF_IDX) {
+                doPowerOff();   // shows BYE BYE + jingle + powers off
+            } else {
+                currentFeed = menuCursor;
+                fetchRSS();
+                renderUI();
+            }
+        }
+
+        // BtnA hold -> exit without change
+        if (StickCP2.BtnA.pressedFor(MENU_HOLD_MS) && !ignoreBtnA) {
+            ignoreBtnA = true;
+            appMode    = MODE_NEWS;
+            renderUI();
+        }
+
+        lastInteraction = millis();
+        delay(20);
+        return;
+    }
+
+    // ────────────────────────────────────────────────
+    //  MODE_NEWS
+    // ────────────────────────────────────────────────
+
+    // BtnA long -> open menu
+    if (StickCP2.BtnA.pressedFor(MENU_HOLD_MS) && !ignoreBtnA) {
+        ignoreBtnA = true;
+        menuCursor = currentFeed;
+        appMode    = MODE_MENU;
+        renderUI();
+        lastInteraction = millis();
+    }
+
+    // BtnA short -> next article
+    if (StickCP2.BtnA.wasReleased()) {
+        if (ignoreBtnA) {
+            ignoreBtnA = false;
+        } else {
+            currentNews = (currentNews + 1) % max(1, totalNews);
+            wrapText();
+            renderUI();
+            lastInteraction = millis();
+        }
+    }
+
+    // BtnB short -> scroll / back to top
+    if (StickCP2.BtnB.wasReleased()) {
+        if ((int)wrappedLines.size() > VISIBLE_LINES) {
+            currentLineOffset++;
+            if (currentLineOffset > (int)wrappedLines.size() - VISIBLE_LINES) {
+                currentLineOffset = 0;
+            }
+        }
+        renderUI();
+        lastInteraction = millis();
+    }
+
+    // BtnB long (4s) -> WiFi portal
+    if (StickCP2.BtnB.pressedFor(WIFI_HOLD_MS)) {
+        startWifiPortal();
+        fetchRSS();
+        renderUI();
+        lastInteraction = millis();
+    }
+
+    // Auto-refresh
+    if (millis() - lastRefresh > REFRESH_INTERVAL) {
+        lastRefresh = millis();
+        fetchRSS();
+        renderUI();
+    }
+
+    delay(20);
+}

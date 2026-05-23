@@ -1,20 +1,11 @@
 /*
  * =====================================================
- *  M5CYBER NEWS v2.1  -  Multi-feed Italian RSS Reader
+ *  M5CYBER NEWS v2.5
+ *  Multi-feed Italian RSS Reader + Local Clock
  *  Target: M5StickC Plus2  (ESP32-PICO, 240x135 px)
  *
- *  CONTROLS
- *  ─────────────────────────────────────────────────
- *  [News mode]
- *    BtnA  short       -> next article
- *    BtnB  short       -> scroll text / back to top
- *    BtnA  2 sec hold  -> open feed menu
- *    BtnB  4 sec hold  -> WiFi portal
- *
- *  [Feed menu]
- *    BtnB  short       -> cycle list (feeds + power off)
- *    BtnA  short       -> SELECT feed / confirm power off
- *    BtnA  2 sec hold  -> EXIT menu (no change)
+ *  Boot directly to clock. Press A to open menu.
+ *  Menu: feed sources, CLOCK mode, POWER OFF.
  * =====================================================
  */
 
@@ -23,25 +14,39 @@
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
 #include <WiFiManager.h>
+#include <Preferences.h>
+#include <time.h>
 #include <vector>
+
+// =====================================================
+//  DISPLAY & CANVAS
+// =====================================================
 
 M5Canvas canvas(&StickCP2.Display);
 
 // =====================================================
-//  CONFIG
+//  CONFIG - Display & Timing
 // =====================================================
 
 #define MAX_NEWS          15
 #define CHARS_PER_LINE    22
-#define VISIBLE_LINES      4
+#define VISIBLE_LINES     4
 
 #define REFRESH_INTERVAL  60000UL
 #define DIM_TIMEOUT       12000UL
 #define SCREEN_TIMEOUT    20000UL
-#define BRIGHTNESS_FULL     200
-#define BRIGHTNESS_DIM       40
-#define MENU_HOLD_MS       2000UL
-#define WIFI_HOLD_MS       4000UL
+#define CLOCK_RETURN_MS   30000UL
+#define BRIGHTNESS_FULL   200
+#define BRIGHTNESS_DIM    40
+#define MENU_HOLD_MS      2000UL
+#define WIFI_HOLD_MS      4000UL
+
+// =====================================================
+//  CONFIG - Timezone
+// =====================================================
+
+#define NTP_SERVER1       "pool.ntp.org"
+#define NTP_SERVER2       "time.nist.gov"
 
 // =====================================================
 //  FEED SOURCES
@@ -63,33 +68,29 @@ const FeedSource FEEDS[] = {
     { "IL FATTO",   "https://www.ilfattoquotidiano.it/feed/",                   0xFFE0 },
 };
 
-const int FEED_COUNT = sizeof(FEEDS) / sizeof(FEEDS[0]);
-const int MENU_ITEMS = FEED_COUNT + 1;   // feeds + POWER OFF entry
-const int POWER_OFF_IDX = FEED_COUNT;
+const int FEED_COUNT      = sizeof(FEEDS) / sizeof(FEEDS[0]);
+const int CLOCK_IDX       = FEED_COUNT;
+const int SET_TZ_IDX      = FEED_COUNT + 1;
+const int POWER_OFF_IDX   = FEED_COUNT + 2;
+const int MENU_ITEMS      = FEED_COUNT + 3;
 
 // =====================================================
-//  NOTE FREQUENCIES  (standard equal temperament)
+//  SOUND - Note Frequencies
 // =====================================================
 
-#define NOTE_C4   262
-#define NOTE_E4   330
-#define NOTE_G4   392
-#define NOTE_B4   494
 #define NOTE_C5   523
-#define NOTE_D5   587
 #define NOTE_E5   659
 #define NOTE_G5   784
 #define NOTE_B5   988
-#define NOTE_C6  1047
-#define NOTE_E6  1319
+#define NOTE_E6   1319
 
 // =====================================================
 //  APP STATE
 // =====================================================
 
-enum AppMode { MODE_NEWS, MODE_MENU, MODE_LOADING };
+enum AppMode { MODE_CLOCK, MODE_NEWS, MODE_MENU, MODE_LOADING };
 
-AppMode appMode        = MODE_NEWS;
+AppMode appMode        = MODE_CLOCK;
 int     currentFeed    = 0;
 int     menuCursor     = 0;
 bool    ignoreBtnA     = false;
@@ -97,19 +98,30 @@ bool    ignoreBtnA     = false;
 String  newsTitles[MAX_NEWS];
 std::vector<String> wrappedLines;
 
-int  totalNews         = 0;
-int  currentNews       = 0;
-int  currentLineOffset = 0;
+int     totalNews      = 0;
+int     currentNews    = 0;
+int     currentLineOffset = 0;
 
-bool displaySleeping   = false;
-bool displayDimmed     = false;
-bool wifiError         = false;
+bool    displaySleeping = false;
+bool    displayDimmed   = false;
+bool    wifiError       = false;
+bool    ntpSynced       = false;
 
-unsigned long lastRefresh     = 0;
-unsigned long lastInteraction = 0;
+String  geoLocation     = "World";  // city, country detected by FreeGeoIP
 
 // =====================================================
-//  CLEAN RSS TEXT
+//  PERSISTENT STORAGE
+// =====================================================
+
+Preferences prefs;
+bool    tzConfigured    = false;    // true if timezone was set (auto or manual)
+
+unsigned long lastRefresh        = 0;
+unsigned long lastInteraction    = 0;
+unsigned long enteredNewsMode    = 0;
+
+// =====================================================
+//  UTILITY - Text Processing
 // =====================================================
 
 String cleanText(String text) {
@@ -154,7 +166,7 @@ String cleanText(String text) {
 }
 
 // =====================================================
-//  WORD WRAP
+//  UTILITY - Word Wrap
 // =====================================================
 
 void wrapText() {
@@ -175,16 +187,19 @@ void wrapText() {
             if (line.length() == 0) {
                 line = word;
             } else if (line.length() + 1 + word.length() <= CHARS_PER_LINE) {
-                line += ' '; line += word;
+                line += ' ';
+                line += word;
             } else {
-                wrappedLines.push_back(line); line = word;
+                wrappedLines.push_back(line);
+                line = word;
             }
             word = "";
         } else {
             if (word.length() >= CHARS_PER_LINE) {
                 if (line.length() > 0) wrappedLines.push_back(line);
                 wrappedLines.push_back(word);
-                word = ""; line = "";
+                word = "";
+                line = "";
             }
             word += c;
         }
@@ -194,233 +209,646 @@ void wrapText() {
 }
 
 // =====================================================
-//  BUZZER  -  direct LEDC PWM drive
-//
-//  M5StickC Plus2 internal buzzer is on GPIO 2.
-//  We bypass the M5Unified Speaker abstraction and
-//  drive it directly via ESP32 LEDC peripheral.
-//  This is reliable on every library version.
+//  APP STATE - Timezone display
 // =====================================================
 
-#define BUZZER_PIN  2
+String  tzDisplay       = "UTC";        // Display string like "UTC+2"
+int     tzOffsetHours   = 0;            // Numeric offset in hours
 
-// Play a single note: freq in Hz, duration in ms
-// Compatible with ESP32 Arduino core 3.x (new LEDC API)
-void playNote(int freq, int durationMs) {
-    ledcAttach(BUZZER_PIN, freq, 8);   // attach pin + set freq + 8-bit res
-    ledcWrite(BUZZER_PIN, 80);         // ~30% duty cycle
-    delay(durationMs);
-    ledcWrite(BUZZER_PIN, 0);          // silence
-    ledcDetach(BUZZER_PIN);
-    delay(18);                          // tiny gap between notes
+// =====================================================
+//  PERSISTENT STORAGE - Load & Save Settings
+// =====================================================
+
+void loadSettings() {
+    prefs.begin("m5cyber", true);  // read-only mode
+    tzConfigured  = prefs.getBool("tzset", false);
+    tzOffsetHours = prefs.getInt("tzoffset", 0);
+    geoLocation   = prefs.getString("geoloc", "World");
+    currentFeed   = prefs.getInt("feed", 0);
+    prefs.end();
+    
+    // Rebuild display string from saved offset
+    if (tzOffsetHours >= 0) {
+        tzDisplay = "UTC+" + String(tzOffsetHours);
+    } else {
+        tzDisplay = "UTC" + String(tzOffsetHours);
+    }
+    
+    // Clamp feed index in case of corruption
+    if (currentFeed < 0 || currentFeed >= FEED_COUNT) currentFeed = 0;
 }
 
-// Startup jingle: ascending C major arpeggio + high finish
-// cheerful, quick (~950 ms total)
+void saveSettings() {
+    prefs.begin("m5cyber", false);  // read-write mode
+    prefs.putBool("tzset", tzConfigured);
+    prefs.putInt("tzoffset", tzOffsetHours);
+    prefs.putString("geoloc", geoLocation);
+    prefs.putInt("feed", currentFeed);
+    prefs.end();
+}
+
+// =====================================================
+//  NETWORK - Geo Locate (get country, city, UTC offset)
+// =====================================================
+
+void geoLocate() {
+    // Try multiple geo services with fallback chain
+    // Primary: ipapi.co (reliable HTTP)
+    // Secondary: freegeoip.app
+    // Fallback: default UTC
+    
+    bool success = false;
+    
+    // ──── Try ipapi.co first ────────────────────────
+    {
+        WiFiClient client;
+        HTTPClient http;
+        http.setTimeout(5000);
+        
+        if (http.begin(client, "http://ipapi.co/json/")) {
+            int httpCode = http.GET();
+            
+            if (httpCode == HTTP_CODE_OK) {
+                String payload = http.getString();
+                
+                // Extract country_name
+                int countryIdx = payload.indexOf("\"country_name\":");
+                if (countryIdx != -1) {
+                    int start = payload.indexOf("\"", countryIdx + 15) + 1;
+                    int end = payload.indexOf("\"", start);
+                    if (start > 0 && end > start) {
+                        geoLocation = payload.substring(start, end);
+                    }
+                }
+                
+                // Extract city if available
+                int cityIdx = payload.indexOf("\"city\":");
+                if (cityIdx != -1) {
+                    int start = payload.indexOf("\"", cityIdx + 7) + 1;
+                    int end = payload.indexOf("\"", start);
+                    if (start > 0 && end > start) {
+                        String city = payload.substring(start, end);
+                        if (city.length() > 0 && city != "Unknown") {
+                            geoLocation = city + ", " + geoLocation;
+                        }
+                    }
+                }
+                
+                // Extract utc_offset
+                int offsetIdx = payload.indexOf("\"utc_offset\":");
+                if (offsetIdx != -1) {
+                    int start = payload.indexOf("\"", offsetIdx + 13) + 1;
+                    int end = payload.indexOf("\"", start);
+                    if (start > 0 && end > start) {
+                        String offsetStr = payload.substring(start, end);
+                        int colonIdx = offsetStr.indexOf(":");
+                        if (colonIdx > 0) {
+                            String hourPart = offsetStr.substring(0, colonIdx);
+                            tzOffsetHours = hourPart.toInt();
+                            
+                            if (tzOffsetHours >= 0) {
+                                tzDisplay = "UTC+" + String(tzOffsetHours);
+                            } else {
+                                tzDisplay = "UTC" + String(tzOffsetHours);
+                            }
+                            
+                            configTime(tzOffsetHours * 3600, 0, NTP_SERVER1, NTP_SERVER2);
+                            ntpSynced = true;
+                            success = true;
+                        }
+                    }
+                }
+            }
+            http.end();
+        }
+    }
+    
+    if (success) {
+        tzConfigured = true;
+        saveSettings();
+        return;
+    }
+    
+    // ──── Fallback: try FreeGeoIP ───────────────────
+    {
+        WiFiClient client;
+        HTTPClient http;
+        http.setTimeout(5000);
+        
+        if (http.begin(client, "http://freegeoip.app/json/")) {
+            int httpCode = http.GET();
+            
+            if (httpCode == HTTP_CODE_OK) {
+                String payload = http.getString();
+                
+                // Extract country_name
+                int countryIdx = payload.indexOf("\"country_name\":");
+                if (countryIdx != -1) {
+                    int start = payload.indexOf("\"", countryIdx + 15) + 1;
+                    int end = payload.indexOf("\"", start);
+                    if (start > 0 && end > start) {
+                        geoLocation = payload.substring(start, end);
+                    }
+                }
+                
+                // Extract city if available
+                int cityIdx = payload.indexOf("\"city\":");
+                if (cityIdx != -1) {
+                    int start = payload.indexOf("\"", cityIdx + 7) + 1;
+                    int end = payload.indexOf("\"", start);
+                    if (start > 0 && end > start) {
+                        String city = payload.substring(start, end);
+                        if (city.length() > 0 && city != "Unknown") {
+                            geoLocation = city + ", " + geoLocation;
+                        }
+                    }
+                }
+                
+                // Extract utc_offset
+                int offsetIdx = payload.indexOf("\"utc_offset\":");
+                if (offsetIdx != -1) {
+                    int start = payload.indexOf("\"", offsetIdx + 13) + 1;
+                    int end = payload.indexOf("\"", start);
+                    if (start > 0 && end > start) {
+                        String offsetStr = payload.substring(start, end);
+                        int colonIdx = offsetStr.indexOf(":");
+                        if (colonIdx > 0) {
+                            String hourPart = offsetStr.substring(0, colonIdx);
+                            tzOffsetHours = hourPart.toInt();
+                            
+                            if (tzOffsetHours >= 0) {
+                                tzDisplay = "UTC+" + String(tzOffsetHours);
+                            } else {
+                                tzDisplay = "UTC" + String(tzOffsetHours);
+                            }
+                            
+                            configTime(tzOffsetHours * 3600, 0, NTP_SERVER1, NTP_SERVER2);
+                            ntpSynced = true;
+                            success = true;
+                        }
+                    }
+                }
+            }
+            http.end();
+        }
+    }
+    
+    if (success) {
+        tzConfigured = true;
+        saveSettings();
+        return;
+    }
+    
+    // ──── Fallback: invite user to set timezone manually ────
+    geoLocation = "SET TZ";
+    tzDisplay = "UTC";
+    tzOffsetHours = 0;
+    configTime(0, 0, NTP_SERVER1, NTP_SERVER2);
+}
+
+// =====================================================
+//  SOUND - Jingles
+// =====================================================
+
 void playStartupJingle() {
-    playNote(NOTE_C5, 80);
-    playNote(NOTE_E5, 80);
-    playNote(NOTE_G5, 80);
-    playNote(NOTE_B5, 80);
-    playNote(NOTE_E6, 320);
+    StickCP2.Speaker.setVolume(160);
+    StickCP2.Speaker.tone(NOTE_C5, 90);   delay(100);
+    StickCP2.Speaker.tone(NOTE_E5, 90);   delay(100);
+    StickCP2.Speaker.tone(NOTE_G5, 90);   delay(100);
+    StickCP2.Speaker.tone(NOTE_B5, 90);   delay(100);
+    StickCP2.Speaker.tone(NOTE_E6, 350);  delay(400);
+    StickCP2.Speaker.stop();
 }
 
-// Shutdown jingle: mirror descend, slower and softer
-// (~1100 ms total - finishes before powerOff)
 void playShutdownJingle() {
-    playNote(NOTE_E6, 100);
-    playNote(NOTE_B5, 100);
-    playNote(NOTE_G5, 100);
-    playNote(NOTE_E5, 100);
-    playNote(NOTE_C5, 460);
+    StickCP2.Speaker.setVolume(140);
+    StickCP2.Speaker.tone(NOTE_E6, 120);  delay(140);
+    StickCP2.Speaker.tone(NOTE_B5, 120);  delay(140);
+    StickCP2.Speaker.tone(NOTE_G5, 120);  delay(140);
+    StickCP2.Speaker.tone(NOTE_E5, 120);  delay(140);
+    StickCP2.Speaker.tone(NOTE_C5, 500);  delay(560);
+    StickCP2.Speaker.stop();
 }
 
 // =====================================================
-//  RENDER: BYE BYE
+//  RENDER - Clock (idle screen)
+// =====================================================
+
+void renderClock() {
+    canvas.fillSprite(BLACK);
+
+    // Header: location + UTC offset + battery
+    canvas.fillRect(0, 0, 240, 18, 0x07E0);
+    canvas.setTextFont(1);
+    canvas.setTextColor(BLACK);
+    canvas.setCursor(6, 4);
+    
+    String locDisplay = geoLocation;
+    if (locDisplay.length() > 12) {
+        locDisplay = locDisplay.substring(0, 12);
+    }
+    canvas.print(locDisplay.c_str());
+    
+    // Timezone in center of header
+    int tzW = canvas.textWidth(tzDisplay.c_str());
+    canvas.setCursor((240 - tzW) / 2, 4);
+    canvas.print(tzDisplay.c_str());
+
+    // Battery on right
+    int bat = StickCP2.Power.getBatteryLevel();
+    char batStr[8];
+    sprintf(batStr, "%d%%", bat);
+    canvas.setTextColor(bat <= 20 ? (uint16_t)RED : (uint16_t)BLACK);
+    canvas.setCursor(200, 4);
+    canvas.print(batStr);
+
+    // Get time
+    time_t now = time(nullptr);
+    struct tm* timeinfo = localtime(&now);
+    char timeStr[16];
+    char dateStr[32];
+    strftime(timeStr, sizeof(timeStr), "%H:%M:%S", timeinfo);
+    strftime(dateStr, sizeof(dateStr), "%a, %d %b %Y", timeinfo);
+
+    // Big time at y=35
+    canvas.setTextFont(7);
+    canvas.setTextColor(0x07E0);
+    int timeW = canvas.textWidth(timeStr);
+    canvas.setCursor((240 - timeW) / 2, 35);
+    canvas.print(timeStr);
+
+    // Date at y=88
+    canvas.setTextFont(2);
+    canvas.setTextColor(0xC618);
+    int dateW = canvas.textWidth(dateStr);
+    canvas.setCursor((240 - dateW) / 2, 88);
+    canvas.print(dateStr);
+
+    // Footer
+    canvas.setTextFont(1);
+    canvas.setTextColor(0x2104);
+    canvas.setCursor(40, 112);
+    canvas.print("A to open menu");
+
+    canvas.pushSprite(0, 0);
+}
+
+// =====================================================
+//  RENDER - Loading
+// =====================================================
+
+void renderLoading() {
+    canvas.fillSprite(BLACK);
+    uint16_t fc = FEEDS[currentFeed].color;
+    canvas.fillRect(0, 0, 240, 18, fc);
+    canvas.setTextColor(BLACK);
+    canvas.setTextFont(1);
+    canvas.setCursor(6, 5);
+    canvas.print(FEEDS[currentFeed].name);
+    canvas.setTextColor(WHITE);
+    canvas.setTextFont(2);
+    canvas.setCursor(54, 50);
+    canvas.print("LOADING...");
+    canvas.fillCircle(102, 88, 5, fc);
+    canvas.drawCircle(120, 88, 5, fc);
+    canvas.drawCircle(138, 88, 5, fc);
+    canvas.pushSprite(0, 0);
+}
+
+// =====================================================
+//  SET TIMEZONE - Structured, clear menu
+// =====================================================
+
+void setTimezoneMenu() {
+    int tzMenuCursor = tzOffsetHours + 12;
+    
+    while (true) {
+        StickCP2.update();
+        
+        canvas.fillSprite(BLACK);
+        
+        // ── Header ──────────────────────────────────
+        canvas.fillRect(0, 0, 240, 18, 0xFD20);
+        canvas.setTextColor(BLACK);
+        canvas.setTextFont(1);
+        canvas.setCursor(70, 5);
+        canvas.print("SET TIMEZONE");
+        
+        // ── UTC value box (centered, boxed) ─────────
+        int currentTZ = tzMenuCursor - 12;
+        char tzStr[12];
+        sprintf(tzStr, "UTC%+d", currentTZ);  // e.g. "UTC+2", "UTC-5", "UTC+0"
+        
+        // Box with border
+        canvas.drawRoundRect(40, 24, 160, 42, 6, 0xFD20);
+        canvas.drawRoundRect(41, 25, 158, 40, 6, 0xFD20);
+        
+        canvas.setTextFont(6);
+        canvas.setTextColor(WHITE);
+        int tzW = canvas.textWidth(tzStr);
+        canvas.setCursor((240 - tzW) / 2, 30);
+        canvas.print(tzStr);
+        
+        // ── Button A: UP ────────────────────────────
+        int rowY = 78;
+        // Button box
+        canvas.fillRoundRect(14, rowY, 24, 16, 3, 0xFD20);
+        canvas.setTextFont(1);
+        canvas.setTextColor(BLACK);
+        canvas.setCursor(23, rowY + 4);
+        canvas.print("A");
+        // Up arrow
+        canvas.fillTriangle(48, rowY + 12, 54, rowY + 3, 60, rowY + 12, 0x07E0);
+        // Label
+        canvas.setTextColor(WHITE);
+        canvas.setCursor(70, rowY + 4);
+        canvas.print("UTC forward");
+        
+        // ── Button B: DOWN ──────────────────────────
+        rowY = 98;
+        canvas.fillRoundRect(14, rowY, 24, 16, 3, 0xFD20);
+        canvas.setTextColor(BLACK);
+        canvas.setCursor(23, rowY + 4);
+        canvas.print("B");
+        // Down arrow
+        canvas.fillTriangle(48, rowY + 3, 54, rowY + 12, 60, rowY + 3, 0xF800);
+        // Label
+        canvas.setTextColor(WHITE);
+        canvas.setCursor(70, rowY + 4);
+        canvas.print("UTC backward");
+        
+        // ── Confirm hint ────────────────────────────
+        rowY = 118;
+        canvas.setTextColor(0xC618);
+        canvas.setCursor(14, rowY);
+        canvas.print("Hold");
+        canvas.fillRoundRect(48, rowY - 2, 20, 13, 3, 0x07E0);
+        canvas.setTextColor(BLACK);
+        canvas.setCursor(55, rowY);
+        canvas.print("B");
+        canvas.setTextColor(0xC618);
+        canvas.setCursor(74, rowY);
+        canvas.print("to SAVE");
+        
+        canvas.pushSprite(0, 0);
+        
+        // ── Controls ────────────────────────────────
+        if (StickCP2.BtnA.wasReleased()) {
+            tzMenuCursor = (tzMenuCursor + 1) % 25;
+        }
+        
+        if (StickCP2.BtnB.wasReleased()) {
+            tzMenuCursor = (tzMenuCursor - 1 + 25) % 25;
+        }
+        
+        if (StickCP2.BtnB.pressedFor(1500)) {
+            tzOffsetHours = tzMenuCursor - 12;
+            
+            if (tzOffsetHours >= 0) {
+                tzDisplay = "UTC+" + String(tzOffsetHours);
+            } else {
+                tzDisplay = "UTC" + String(tzOffsetHours);
+            }
+            
+            geoLocation = tzDisplay;  // header no longer shows "SET TZ"
+            
+            configTime(tzOffsetHours * 3600, 0, NTP_SERVER1, NTP_SERVER2);
+            ntpSynced = true;
+            
+            // Save to persistent storage
+            tzConfigured = true;
+            saveSettings();
+            
+            delay(500);
+            return;
+        }
+        
+        delay(20);
+    }
+}
+
+// =====================================================
+//  RENDER - Menu
+// =====================================================
+
+void renderMenu() {
+    canvas.fillSprite(BLACK);
+    canvas.fillRect(0, 0, 240, 18, 0x630C);
+    canvas.setTextColor(WHITE);
+    canvas.setTextFont(1);
+    canvas.setCursor(6, 5);
+    canvas.print("SELECT SOURCE");
+
+    const int ROW_H    = 16;
+    const int START_Y  = 20;
+    const int VIS_ROWS = 6;
+
+    int scrollOff = 0;
+    if (menuCursor >= VIS_ROWS) scrollOff = menuCursor - VIS_ROWS + 1;
+
+    for (int i = 0; i < VIS_ROWS && (i + scrollOff) < MENU_ITEMS; i++) {
+        int idx = i + scrollOff;
+        int y   = START_Y + i * ROW_H;
+        bool sel = (idx == menuCursor);
+
+        if (idx == CLOCK_IDX) {
+            if (sel) {
+                canvas.fillRect(0, y, 230, ROW_H - 1, 0x07E0);
+                canvas.setTextColor(BLACK);
+            } else {
+                canvas.setTextColor(0x07E0);
+            }
+            canvas.setTextFont(2);
+            canvas.setCursor(8, y + 1);
+            canvas.print("CLOCK");
+
+        } else if (idx == SET_TZ_IDX) {
+            if (sel) {
+                canvas.fillRect(0, y, 230, ROW_H - 1, 0xFD20);
+                canvas.setTextColor(BLACK);
+            } else {
+                canvas.setTextColor(0xFD20);
+            }
+            canvas.setTextFont(2);
+            canvas.setCursor(8, y + 1);
+            canvas.print("SET TZ");
+
+        } else if (idx == POWER_OFF_IDX) {
+            if (sel) {
+                canvas.fillRect(0, y, 230, ROW_H - 1, RED);
+                canvas.setTextColor(BLACK);
+            } else {
+                canvas.setTextColor(RED);
+            }
+            canvas.setTextFont(2);
+            canvas.setCursor(8, y + 1);
+            canvas.print("POWER OFF");
+
+        } else {
+            if (sel) {
+                canvas.fillRect(0, y, 230, ROW_H - 1, FEEDS[idx].color);
+                canvas.setTextColor(BLACK);
+            } else {
+                canvas.setTextColor(0xC618);
+            }
+            canvas.setTextFont(2);
+            canvas.setCursor(8, y + 1);
+            canvas.print(FEEDS[idx].name);
+
+            if (idx == currentFeed) {
+                canvas.setTextFont(1);
+                canvas.setTextColor(sel ? (uint16_t)BLACK : FEEDS[idx].color);
+                canvas.setCursor(183, y + 4);
+                canvas.print("[ON]");
+            }
+        }
+    }
+
+    if (MENU_ITEMS > VIS_ROWS) {
+        int trackH = VIS_ROWS * ROW_H;
+        int thumbH = max(4, trackH * VIS_ROWS / MENU_ITEMS);
+        int thumbY = START_Y + (menuCursor * (trackH - thumbH)) / max(1, MENU_ITEMS - 1);
+        canvas.fillRect(234, START_Y, 4, trackH, 0x2104);
+        canvas.fillRect(234, thumbY, 4, thumbH, 0xC618);
+    }
+
+    canvas.setTextColor(0x4208);
+    canvas.setTextFont(1);
+    canvas.setCursor(8, 122);
+    canvas.print("B NEXT   A SELECT   Ahold EXIT");
+
+    canvas.pushSprite(0, 0);
+}
+
+// =====================================================
+//  RENDER - News
+// =====================================================
+
+void renderNews() {
+    if (displaySleeping) return;
+    canvas.fillSprite(BLACK);
+
+    uint16_t hdrColor = wifiError ? (uint16_t)RED : FEEDS[currentFeed].color;
+    canvas.fillRect(0, 0, 240, 18, hdrColor);
+    canvas.setTextColor(BLACK);
+    canvas.setTextFont(1);
+    char hdr[36];
+    sprintf(hdr, "%s  %d/%d", FEEDS[currentFeed].name, currentNews + 1, totalNews);
+    canvas.setCursor(6, 5);
+    canvas.print(hdr);
+
+    int bat = StickCP2.Power.getBatteryLevel();
+    char batStr[8];
+    sprintf(batStr, "%d%%", bat);
+    canvas.setTextColor(bat <= 20 ? (uint16_t)RED : (uint16_t)BLACK);
+    canvas.setCursor(205, 5);
+    canvas.print(batStr);
+
+    canvas.drawRect(0, 20, 240, 96, 0x4208);
+
+    canvas.setTextColor(WHITE);
+    canvas.setTextFont(2);
+    int y = 28;
+    for (int i = currentLineOffset;
+         i < min(currentLineOffset + VISIBLE_LINES, (int)wrappedLines.size());
+         i++) {
+        canvas.setCursor(8, y);
+        canvas.print(wrappedLines[i]);
+        y += 18;
+    }
+
+    if ((int)wrappedLines.size() > VISIBLE_LINES) {
+        int total  = (int)wrappedLines.size();
+        int trackH = 80;
+        int thumbH = max(6, trackH * VISIBLE_LINES / total);
+        int maxOff = total - VISIBLE_LINES;
+        int thumbY = 22 + (currentLineOffset * (trackH - thumbH)) / max(1, maxOff);
+        canvas.fillRect(234, 22, 4, trackH, 0x2104);
+        canvas.fillRect(234, thumbY, 4, thumbH, FEEDS[currentFeed].color);
+    }
+
+    bool hasMore = (currentLineOffset + VISIBLE_LINES < (int)wrappedLines.size());
+    canvas.setTextFont(1);
+    if (hasMore) {
+        canvas.setTextColor(FEEDS[currentFeed].color);
+        canvas.setCursor(8, 122);
+        canvas.print("A NEXT   B SCROLL    Ahold MENU");
+    } else {
+        canvas.setTextColor(0x4208);
+        canvas.setCursor(8, 122);
+        canvas.print("A NEXT   B TOP       Ahold MENU");
+    }
+
+    canvas.pushSprite(0, 0);
+}
+
+// =====================================================
+//  RENDER - Bye Bye
 // =====================================================
 
 void renderByeBye() {
-    StickCP2.Display.setBrightness(BRIGHTNESS_FULL);  // sveglia display se dimmato
     canvas.fillSprite(BLACK);
-
-    // Red double border
     canvas.drawRect(0, 0, 240, 135, RED);
     canvas.drawRect(2, 2, 236, 131, 0x8000);
-
-    // Big "BYE BYE!" in red
     canvas.setTextFont(4);
     canvas.setTextColor(RED);
     canvas.setCursor(44, 26);
     canvas.print("BYE BYE!");
-
-    // Separator
     canvas.drawFastHLine(20, 70, 200, 0x8000);
-
-    // Subtitle
     canvas.setTextFont(2);
     canvas.setTextColor(DARKGREY);
     canvas.setCursor(44, 80);
     canvas.print("powering off...");
-
-    // Hint
     canvas.setTextFont(1);
     canvas.setTextColor(0x4208);
     canvas.setCursor(20, 112);
     canvas.print("hold side button 2s to power on");
-
     canvas.pushSprite(0, 0);
-    delay(200);  // ensure frame is fully pushed before jingle starts
 }
 
 // =====================================================
-//  POWER OFF  -  shows BYE BYE + jingle + cuts power
+//  RENDER - Master Dispatch
+// =====================================================
+
+void renderUI() {
+    switch (appMode) {
+        case MODE_CLOCK:   renderClock();   break;
+        case MODE_LOADING: renderLoading(); break;
+        case MODE_MENU:    renderMenu();    break;
+        case MODE_NEWS:    renderNews();    break;
+    }
+}
+
+// =====================================================
+//  POWER - Off
 // =====================================================
 
 void doPowerOff() {
-    renderByeBye();          // schermata visibile prima del jingle
-    playShutdownJingle();    // ~1100 ms, blocking via delay()
-    delay(800);              // pausa finale - schermata resta visibile
+    renderByeBye();
+    playShutdownJingle();
+    delay(600);
     StickCP2.Power.powerOff();
 }
 
 // =====================================================
-//  FORWARD DECLARATION
+//  DISPLAY - Wake & Dim
 // =====================================================
 
-void renderUI();
-
-// =====================================================
-//  SPLASH  -  Pixel-art "NEWS!" drawn with fillRect
-//
-//  Each letter is a 5-col x 7-row bitmap.
-//  Each "pixel" renders as a (PX_W-1) x (PX_H-1) rect
-//  leaving a 1-px gap for a clean grid look.
-//
-//  Bit order per row: bit 4 = leftmost column.
-// =====================================================
-
-// --- glyph bitmaps (5 cols x 7 rows) ---------------
-
-const uint8_t G_N[7] = {
-    0b10001,   //  #   #
-    0b11001,   //  ##  #
-    0b10101,   //  # # #
-    0b10011,   //  #  ##
-    0b10001,   //  #   #
-    0b10001,   //  #   #
-    0b10001    //  #   #
-};
-const uint8_t G_E[7] = {
-    0b11111,   //  #####
-    0b10000,   //  #
-    0b10000,   //  #
-    0b11110,   //  ####
-    0b10000,   //  #
-    0b10000,   //  #
-    0b11111    //  #####
-};
-const uint8_t G_W[7] = {
-    0b10001,   //  #   #
-    0b10001,   //  #   #
-    0b10001,   //  #   #
-    0b10101,   //  # # #
-    0b10101,   //  # # #
-    0b11011,   //  ## ##
-    0b10001    //  #   #
-};
-const uint8_t G_S[7] = {
-    0b01111,   //   ####
-    0b10000,   //  #
-    0b10000,   //  #
-    0b01110,   //   ###
-    0b00001,   //      #
-    0b00001,   //      #
-    0b11110    //  ####
-};
-
-// Exclamation mark: 2 cols x 7 rows (bit 1 = left col)
-const uint8_t G_EXCL[7] = {
-    0b11,      //  ##
-    0b11,      //  ##
-    0b11,      //  ##
-    0b11,      //  ##
-    0b00,      //
-    0b11,      //  ##
-    0b00       //
-};
-
-// Draw a glyph at (x,y). cols = number of bit columns in the mask.
-void drawGlyph(int x, int y, const uint8_t* g, int cols, uint16_t col) {
-    const int PX_W = 5;
-    const int PX_H = 8;
-    for (int row = 0; row < 7; row++) {
-        for (int c = 0; c < cols; c++) {
-            if (g[row] & (1 << (cols - 1 - c))) {
-                canvas.fillRect(
-                    x + c * PX_W,
-                    y + row * PX_H,
-                    PX_W - 1,
-                    PX_H - 1,
-                    col
-                );
-            }
-        }
+void wakeDisplay() {
+    if (displaySleeping) {
+        StickCP2.Display.wakeup();
+        StickCP2.Display.setBrightness(BRIGHTNESS_FULL);
+        displaySleeping = false;
+        displayDimmed   = false;
+    } else if (displayDimmed) {
+        StickCP2.Display.setBrightness(BRIGHTNESS_FULL);
+        displayDimmed = false;
     }
-}
-
-void renderSplash() {
-    canvas.fillSprite(BLACK);
-
-    // Double border for depth
-    canvas.drawRect(0, 0, 240, 135, 0x07E0);          // outer green
-    canvas.drawRect(2, 2, 236, 131, 0x03E0);           // inner darker green
-
-    // Scanline effect: subtle dark horizontal stripes across the art area
-    for (int y = 18; y < 88; y += 2) {
-        canvas.drawFastHLine(4, y, 232, 0x0200);        // near-black green tint
-    }
-
-    // ── Pixel-art "NEWS!" ──────────────────────────
-    //  PX_W=5, PX_H=8 -> letter = 25x56 px
-    //  N,E,W,S: 5-col glyphs  ->  width = 5*5 = 25 px
-    //  !       : 2-col glyph  ->  width = 2*5 = 10 px
-    //  gap between letters    :  5 px
-    //  total = (25+5)*4 + 10  = 130 px  -> start x = (240-130)/2 = 55
-    // ───────────────────────────────────────────────
-
-    const int LWIDTH = 25;   // letter pixel width
-    const int GAP    = 5;    // gap between letters
-    const int SX     = 55;   // start x
-    const int SY     = 16;   // start y
-    const uint16_t GC = 0x07E0;   // glyph color (green)
-
-    drawGlyph(SX + 0*(LWIDTH+GAP), SY, G_N,    5, GC);
-    drawGlyph(SX + 1*(LWIDTH+GAP), SY, G_E,    5, GC);
-    drawGlyph(SX + 2*(LWIDTH+GAP), SY, G_W,    5, GC);
-    drawGlyph(SX + 3*(LWIDTH+GAP), SY, G_S,    5, GC);
-    drawGlyph(SX + 4*(LWIDTH+GAP), SY, G_EXCL, 2, GC);
-
-    // ── Decorative line ────────────────────────────
-    canvas.drawFastHLine(10, 90, 220, 0x07E0);
-    canvas.drawFastHLine(10, 92, 220, 0x03E0);
-
-    // ── Subtitle ───────────────────────────────────
-    canvas.setTextFont(2);
-    canvas.setTextColor(0x8410);   // medium grey
-    canvas.setCursor(44, 98);
-    canvas.print("M5CYBER  MULTI-FEED  v2");
-
-    // ── Hint ───────────────────────────────────────
-    canvas.setTextFont(1);
-    canvas.setTextColor(0x2104);   // dark grey
-    canvas.setCursor(72, 119);
-    canvas.print("connecting to WiFi...");
-
-    canvas.pushSprite(0, 0);
+    lastInteraction = millis();
 }
 
 // =====================================================
-//  FETCH RSS
+//  NETWORK - Fetch RSS
 // =====================================================
 
 void fetchRSS() {
@@ -459,10 +887,11 @@ void fetchRSS() {
     currentNews = 0;
     wrapText();
     appMode = MODE_NEWS;
+    enteredNewsMode = millis();
 }
 
 // =====================================================
-//  WIFI PORTAL
+//  NETWORK - WiFi Setup
 // =====================================================
 
 void startWifiPortal() {
@@ -493,204 +922,27 @@ void startWifiPortal() {
     canvas.pushSprite(0, 0);
 
     if (!wm.autoConnect("M5-CYBER")) ESP.restart();
-}
-
-// =====================================================
-//  RENDER: LOADING
-// =====================================================
-
-void renderLoading() {
-    canvas.fillSprite(BLACK);
-
-    uint16_t fc = FEEDS[currentFeed].color;
-    canvas.fillRect(0, 0, 240, 18, fc);
-    canvas.setTextColor(BLACK);
-    canvas.setTextFont(1);
-    canvas.setCursor(6, 5);
-    canvas.print(FEEDS[currentFeed].name);
-
-    canvas.setTextColor(WHITE);
-    canvas.setTextFont(2);
-    canvas.setCursor(54, 50);
-    canvas.print("LOADING...");
-
-    canvas.fillCircle(102, 88, 5, fc);
-    canvas.drawCircle(120, 88, 5, fc);
-    canvas.drawCircle(138, 88, 5, fc);
-
-    canvas.pushSprite(0, 0);
-}
-
-// =====================================================
-//  RENDER: MENU
-// =====================================================
-
-void renderMenu() {
-    canvas.fillSprite(BLACK);
-
-    // Header
-    canvas.fillRect(0, 0, 240, 18, 0x630C);
-    canvas.setTextColor(WHITE);
-    canvas.setTextFont(1);
-    canvas.setCursor(6, 5);
-    canvas.print("SELECT FEED SOURCE");
-
-    const int ROW_H    = 16;
-    const int START_Y  = 20;
-    const int VIS_ROWS = 6;
-
-    int scrollOff = 0;
-    if (menuCursor >= VIS_ROWS) scrollOff = menuCursor - VIS_ROWS + 1;
-
-    for (int i = 0; i < VIS_ROWS && (i + scrollOff) < MENU_ITEMS; i++) {
-        int  idx = i + scrollOff;
-        int  y   = START_Y + i * ROW_H;
-        bool sel = (idx == menuCursor);
-
-        if (idx == POWER_OFF_IDX) {
-            // ── POWER OFF entry ─────────────────────
-            if (sel) {
-                canvas.fillRect(0, y, 230, ROW_H - 1, RED);
-                canvas.setTextColor(BLACK);
-            } else {
-                canvas.setTextColor(RED);
-            }
-            canvas.setTextFont(2);
-            canvas.setCursor(8, y + 1);
-            canvas.print("POWER OFF");
-        } else {
-            // ── Feed entry ──────────────────────────
-            if (sel) {
-                canvas.fillRect(0, y, 230, ROW_H - 1, FEEDS[idx].color);
-                canvas.setTextColor(BLACK);
-            } else {
-                canvas.setTextColor(0xC618);
-            }
-            canvas.setTextFont(2);
-            canvas.setCursor(8, y + 1);
-            canvas.print(FEEDS[idx].name);
-
-            if (idx == currentFeed) {
-                canvas.setTextFont(1);
-                canvas.setTextColor(sel ? (uint16_t)BLACK : FEEDS[idx].color);
-                canvas.setCursor(183, y + 4);
-                canvas.print("[ON]");
-            }
+    
+    // ── Timezone handling ───────────────────────────
+    if (tzConfigured) {
+        // Already configured (loaded from storage) - skip slow geoloc
+        // Just apply the saved offset directly
+        configTime(tzOffsetHours * 3600, 0, NTP_SERVER1, NTP_SERVER2);
+    } else {
+        // First time - detect location and timezone
+        geoLocate();
+    }
+    
+    // Wait for NTP sync (max 5 seconds)
+    for (int i = 0; i < 50; i++) {
+        delay(100);
+        time_t now = time(nullptr);
+        struct tm* timeinfo = localtime(&now);
+        if (timeinfo->tm_year > 120) {
+            ntpSynced = true;
+            break;
         }
     }
-
-    // Scrollbar
-    if (MENU_ITEMS > VIS_ROWS) {
-        int trackH = VIS_ROWS * ROW_H;
-        int thumbH = max(4, trackH * VIS_ROWS / MENU_ITEMS);
-        int thumbY = START_Y + (menuCursor * (trackH - thumbH)) / max(1, MENU_ITEMS - 1);
-        canvas.fillRect(234, START_Y, 4, trackH, 0x2104);
-        canvas.fillRect(234, thumbY,  4, thumbH, 0xC618);
-    }
-
-    // Footer
-    canvas.setTextColor(0x4208);
-    canvas.setTextFont(1);
-    canvas.setCursor(8, 122);
-    canvas.print("B NEXT FEED     A SELECT     Ahold EXIT");
-
-    canvas.pushSprite(0, 0);
-}
-
-// =====================================================
-//  RENDER: NEWS
-// =====================================================
-
-void renderNews() {
-    if (displaySleeping) return;
-    canvas.fillSprite(BLACK);
-
-    // Header
-    uint16_t hdrColor = wifiError ? (uint16_t)RED : FEEDS[currentFeed].color;
-    canvas.fillRect(0, 0, 240, 18, hdrColor);
-    canvas.setTextColor(BLACK);
-    canvas.setTextFont(1);
-    char hdr[36];
-    sprintf(hdr, "%s  %d/%d", FEEDS[currentFeed].name, currentNews + 1, totalNews);
-    canvas.setCursor(6, 5);
-    canvas.print(hdr);
-
-    int  bat = StickCP2.Power.getBatteryLevel();
-    char batStr[8];
-    sprintf(batStr, "%d%%", bat);
-    canvas.setTextColor(bat <= 20 ? (uint16_t)RED : (uint16_t)BLACK);
-    canvas.setCursor(205, 5);
-    canvas.print(batStr);
-
-    // News box
-    canvas.drawRect(0, 20, 240, 96, 0x4208);
-
-    // Text
-    canvas.setTextColor(WHITE);
-    canvas.setTextFont(2);
-    int y = 28;
-    for (int i = currentLineOffset;
-         i < min(currentLineOffset + VISIBLE_LINES, (int)wrappedLines.size());
-         i++) {
-        canvas.setCursor(8, y);
-        canvas.print(wrappedLines[i]);
-        y += 18;
-    }
-
-    // Scroll thumb
-    if ((int)wrappedLines.size() > VISIBLE_LINES) {
-        int total  = (int)wrappedLines.size();
-        int trackH = 80;
-        int thumbH = max(6, trackH * VISIBLE_LINES / total);
-        int maxOff = total - VISIBLE_LINES;
-        int thumbY = 22 + (currentLineOffset * (trackH - thumbH)) / max(1, maxOff);
-        canvas.fillRect(234, 22, 4, trackH, 0x2104);
-        canvas.fillRect(234, thumbY, 4, thumbH, FEEDS[currentFeed].color);
-    }
-
-    // Footer
-    bool hasMore = (currentLineOffset + VISIBLE_LINES < (int)wrappedLines.size());
-    canvas.setTextFont(1);
-    if (hasMore) {
-        canvas.setTextColor(FEEDS[currentFeed].color);
-        canvas.setCursor(8, 122);
-        canvas.print("A NEXT   B SCROLL    Ahold MENU");
-    } else {
-        canvas.setTextColor(0x4208);
-        canvas.setCursor(8, 122);
-        canvas.print("A NEXT   B TOP       Ahold MENU");
-    }
-
-    canvas.pushSprite(0, 0);
-}
-
-// =====================================================
-//  MASTER RENDER
-// =====================================================
-
-void renderUI() {
-    switch (appMode) {
-        case MODE_LOADING: renderLoading(); break;
-        case MODE_MENU:    renderMenu();    break;
-        case MODE_NEWS:    renderNews();    break;
-    }
-}
-
-// =====================================================
-//  WAKE / DIM
-// =====================================================
-
-void wakeDisplay() {
-    if (displaySleeping) {
-        StickCP2.Display.wakeup();
-        StickCP2.Display.setBrightness(BRIGHTNESS_FULL);
-        displaySleeping = false;
-        displayDimmed   = false;
-    } else if (displayDimmed) {
-        StickCP2.Display.setBrightness(BRIGHTNESS_FULL);
-        displayDimmed = false;
-    }
-    lastInteraction = millis();
 }
 
 // =====================================================
@@ -704,15 +956,23 @@ void setup() {
     StickCP2.Display.setBrightness(BRIGHTNESS_FULL);
     canvas.createSprite(240, 135);
 
-    renderSplash();
-    playStartupJingle();   // ascending arpeggio on buzzer (~950 ms)
+    StickCP2.Speaker.begin();
+    StickCP2.Speaker.setVolume(160);
+
+    // Load saved settings (timezone, location, last feed)
+    loadSettings();
+
+    renderClock();
+    playStartupJingle();
 
     startWifiPortal();
-    fetchRSS();
-    renderUI();
-
+    
     lastRefresh     = millis();
     lastInteraction = millis();
+    enteredNewsMode = 0;
+
+    appMode = MODE_CLOCK;
+    renderUI();
 }
 
 // =====================================================
@@ -737,7 +997,7 @@ void loop() {
         displayDimmed   = false;
     }
 
-    // Wake from dim or sleep: first press wakes only, no action
+    // Wake
     if (displaySleeping || displayDimmed) {
         if (StickCP2.BtnA.wasPressed() || StickCP2.BtnB.wasPressed()) {
             wakeDisplay();
@@ -746,42 +1006,21 @@ void loop() {
         return;
     }
 
-    // ────────────────────────────────────────────────
-    //  MODE_MENU
-    //    BtnB  short   -> cycle feed list (down, wraps)
-    //    BtnA  short   -> SELECT highlighted feed + load
-    //    BtnA  2s hold -> EXIT menu (no change)
-    //
-    //  NOTE: Button C (power) is not accessible with this
-    //  library version. Update M5StickCPlus2 + M5Unified
-    //  to latest to get StickCP2.BtnPWR support.
-    // ────────────────────────────────────────────────
-    if (appMode == MODE_MENU) {
-
-        // BtnB -> cycle list down (feeds + POWER OFF, wraps)
-        if (StickCP2.BtnB.wasReleased()) {
-            menuCursor = (menuCursor + 1) % MENU_ITEMS;
+    // ─────────────────────────────────────────────
+    //  MODE_CLOCK
+    // ─────────────────────────────────────────────
+    if (appMode == MODE_CLOCK) {
+        static unsigned long lastClockRefresh = 0;
+        if (millis() - lastClockRefresh > 1000) {
+            lastClockRefresh = millis();
             renderUI();
         }
 
-        // BtnA short -> select feed or power off
         if (StickCP2.BtnA.wasReleased()) {
-            if (ignoreBtnA) {
-                ignoreBtnA = false;
-            } else if (menuCursor == POWER_OFF_IDX) {
-                doPowerOff();   // shows BYE BYE + jingle + powers off
-            } else {
-                currentFeed = menuCursor;
-                fetchRSS();
-                renderUI();
-            }
-        }
-
-        // BtnA hold -> exit without change
-        if (StickCP2.BtnA.pressedFor(MENU_HOLD_MS) && !ignoreBtnA) {
-            ignoreBtnA = true;
-            appMode    = MODE_NEWS;
+            menuCursor = currentFeed;
+            appMode    = MODE_MENU;
             renderUI();
+            lastInteraction = millis();
         }
 
         lastInteraction = millis();
@@ -789,56 +1028,108 @@ void loop() {
         return;
     }
 
-    // ────────────────────────────────────────────────
+    // ─────────────────────────────────────────────
     //  MODE_NEWS
-    // ────────────────────────────────────────────────
+    // ─────────────────────────────────────────────
+    if (appMode == MODE_NEWS) {
+        if (enteredNewsMode > 0 && millis() - enteredNewsMode > CLOCK_RETURN_MS) {
+            appMode = MODE_CLOCK;
+            renderUI();
+            enteredNewsMode = 0;
+            lastInteraction = millis();
+        }
 
-    // BtnA long -> open menu
-    if (StickCP2.BtnA.pressedFor(MENU_HOLD_MS) && !ignoreBtnA) {
-        ignoreBtnA = true;
-        menuCursor = currentFeed;
-        appMode    = MODE_MENU;
-        renderUI();
-        lastInteraction = millis();
-    }
-
-    // BtnA short -> next article
-    if (StickCP2.BtnA.wasReleased()) {
-        if (ignoreBtnA) {
-            ignoreBtnA = false;
-        } else {
-            currentNews = (currentNews + 1) % max(1, totalNews);
-            wrapText();
+        if (StickCP2.BtnA.pressedFor(MENU_HOLD_MS) && !ignoreBtnA) {
+            ignoreBtnA = true;
+            menuCursor = currentFeed;
+            appMode    = MODE_MENU;
             renderUI();
             lastInteraction = millis();
         }
-    }
 
-    // BtnB short -> scroll / back to top
-    if (StickCP2.BtnB.wasReleased()) {
-        if ((int)wrappedLines.size() > VISIBLE_LINES) {
-            currentLineOffset++;
-            if (currentLineOffset > (int)wrappedLines.size() - VISIBLE_LINES) {
-                currentLineOffset = 0;
+        if (StickCP2.BtnA.wasReleased()) {
+            if (ignoreBtnA) {
+                ignoreBtnA = false;
+            } else {
+                currentNews = (currentNews + 1) % max(1, totalNews);
+                wrapText();
+                renderUI();
+                lastInteraction = millis();
+                enteredNewsMode = millis();
             }
         }
-        renderUI();
-        lastInteraction = millis();
+
+        if (StickCP2.BtnB.wasReleased()) {
+            if ((int)wrappedLines.size() > VISIBLE_LINES) {
+                currentLineOffset++;
+                if (currentLineOffset > (int)wrappedLines.size() - VISIBLE_LINES) {
+                    currentLineOffset = 0;
+                }
+            }
+            renderUI();
+            lastInteraction = millis();
+            enteredNewsMode = millis();
+        }
+
+        if (StickCP2.BtnB.pressedFor(WIFI_HOLD_MS)) {
+            startWifiPortal();
+            fetchRSS();
+            renderUI();
+            lastInteraction = millis();
+            enteredNewsMode = millis();
+        }
+
+        if (millis() - lastRefresh > REFRESH_INTERVAL) {
+            lastRefresh = millis();
+            fetchRSS();
+            renderUI();
+        }
+
+        delay(20);
+        return;
     }
 
-    // BtnB long (4s) -> WiFi portal
-    if (StickCP2.BtnB.pressedFor(WIFI_HOLD_MS)) {
-        startWifiPortal();
-        fetchRSS();
-        renderUI();
-        lastInteraction = millis();
-    }
+    // ─────────────────────────────────────────────
+    //  MODE_MENU
+    // ─────────────────────────────────────────────
+    if (appMode == MODE_MENU) {
+        if (StickCP2.BtnB.wasReleased()) {
+            menuCursor = (menuCursor + 1) % MENU_ITEMS;
+            renderUI();
+        }
 
-    // Auto-refresh
-    if (millis() - lastRefresh > REFRESH_INTERVAL) {
-        lastRefresh = millis();
-        fetchRSS();
-        renderUI();
+        if (StickCP2.BtnA.wasReleased()) {
+            if (ignoreBtnA) {
+                ignoreBtnA = false;
+            } else if (menuCursor == CLOCK_IDX) {
+                appMode = MODE_CLOCK;
+                renderUI();
+                lastInteraction = millis();
+            } else if (menuCursor == SET_TZ_IDX) {
+                setTimezoneMenu();
+                renderUI();
+                lastInteraction = millis();
+            } else if (menuCursor == POWER_OFF_IDX) {
+                doPowerOff();
+            } else {
+                currentFeed = menuCursor;
+                saveSettings();
+                fetchRSS();
+                renderUI();
+                enteredNewsMode = millis();
+            }
+        }
+
+        if (StickCP2.BtnA.pressedFor(MENU_HOLD_MS) && !ignoreBtnA) {
+            ignoreBtnA = true;
+            appMode    = MODE_NEWS;
+            renderUI();
+            enteredNewsMode = millis();
+        }
+
+        lastInteraction = millis();
+        delay(20);
+        return;
     }
 
     delay(20);
