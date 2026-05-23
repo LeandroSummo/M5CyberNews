@@ -1,0 +1,34 @@
+# Arduino build artifacts
+build/
+*.hex
+*.bin
+*.elf
+*.map
+*.d
+*.o
+
+# Arduino IDE local files
+.theia/
+.vscode/
+*.cache
+
+# Compiled sketch cache
+/tmp/arduino*
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Windows
+Thumbs.db
+desktop.ini
+
+# Linux
+*~
+
+# Backup / editor files
+*.bak
+*.swp
+*.orig
